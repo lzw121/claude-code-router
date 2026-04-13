@@ -66,8 +66,9 @@ COPY packages/ui/dist/. ./packages/server/dist/
 # 复制 PM2 配置文件
 COPY packages/server/ecosystem.config.cjs /app/
 
-# 创建日志目录
+# 创建日志目录 + Docker 环境标识（用于自动绑定 0.0.0.0）
 RUN mkdir -p /root/.claude-code-router/logs
+ENV DOCKER=true
 
 # 暴露端口
 EXPOSE 3456

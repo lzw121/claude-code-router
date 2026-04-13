@@ -46,7 +46,7 @@ try {
 
   // Step 4: Build the CLI application
   console.log('Building CLI application...');
-  execSync('esbuild src/cli.ts --bundle --platform=node --minify --tree-shaking=true --outfile=dist/cli.js', {
+  execSync('npx esbuild src/cli.ts --bundle --platform=node --minify --tree-shaking=true --outfile=dist/cli.js', {
     stdio: 'inherit',
     cwd: cliDir
   });

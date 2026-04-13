@@ -6,6 +6,8 @@ import {
   cleanupPidFile,
   isServiceRunning,
   getServiceInfo,
+  findServicePid,
+  killProcess,
 } from "./utils/processCheck";
 import { runModelSelector } from "./utils/modelSelector";
 import { activateCommand } from "./utils/activateCommand";
@@ -214,8 +216,16 @@ async function main() {
       break;
     case "stop":
       try {
-        const pid = parseInt(readFileSync(PID_FILE, "utf-8"));
-        process.kill(pid);
+        // 使用 findServicePid 替代直接读 PID 文件，支持端口 fallback
+        const pid = findServicePid();
+        if (pid === null) {
+          console.log(
+            "No running service found. It may have already been stopped."
+          );
+          cleanupPidFile();
+          break;
+        }
+        killProcess(pid);
         cleanupPidFile();
         if (existsSync(REFERENCE_COUNT_FILE)) {
           try {

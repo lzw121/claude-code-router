@@ -51,11 +51,21 @@ export const calculateTokenCount = (
           } else if (contentPart.type === "tool_use") {
             tokenCount += enc.encode(JSON.stringify(contentPart.input)).length;
           } else if (contentPart.type === "tool_result") {
-            tokenCount += enc.encode(
-              typeof contentPart.content === "string"
-                ? contentPart.content
-                : JSON.stringify(contentPart.content)
-            ).length;
+            // tool_result 的 content 可能包含 base64 图片，需跳过图片数据避免 token 暴增 (#1293)
+            const resultContent = contentPart.content;
+            if (typeof resultContent === "string") {
+              tokenCount += enc.encode(resultContent).length;
+            } else if (Array.isArray(resultContent)) {
+              resultContent.forEach((part: any) => {
+                if (part.type === "text") {
+                  tokenCount += enc.encode(part.text || "").length;
+                }
+                // 跳过 type=image 的 base64 数据，图片按固定 token 数估算
+              });
+            }
+          } else if (contentPart.type === "image") {
+            // base64 图片按约 1000 token 估算，避免编码整个 base64 字符串 (#1293)
+            tokenCount += 1000;
           }
         });
       }
@@ -145,8 +155,27 @@ const getUseModel = async (
     return { model: req.body.model, scenarioType: 'default' };
   }
 
-  // if tokenCount is greater than the configured threshold, use the long context model
-  const longContextThreshold = Router?.longContextThreshold || 60000;
+  // CCR-SUBAGENT-MODEL tag 优先级最高（在 longContext 之前检查）
+  if (
+    Array.isArray(req.body?.system) &&
+    req.body.system.some((item: any) =>
+      typeof item?.text === 'string' && item.text.includes('<CCR-SUBAGENT-MODEL>')
+    )
+  ) {
+    for (const item of req.body.system) {
+      if (typeof item?.text !== 'string') continue;
+      const match = item.text.match(/<CCR-SUBAGENT-MODEL>(.*?)<\/CCR-SUBAGENT-MODEL>/s);
+      if (match) {
+        item.text = item.text.replace(`<CCR-SUBAGENT-MODEL>${match[1]}</CCR-SUBAGENT-MODEL>`, "");
+        return { model: match[1], scenarioType: 'default' };
+      }
+    }
+  }
+
+  // longContext: token 数超阈值时使用长上下文模型
+  // 默认值 999999：Claude Code 系统 prompt（skills/tools/agents）本身就超 60000，
+  // 导致所有子代理请求被强制转到 longContext 模型，覆盖 custom-router 决策
+  const longContextThreshold = Router?.longContextThreshold || 999999;
   const lastUsageThreshold =
     lastUsage &&
     lastUsage.input_tokens > longContextThreshold &&
@@ -158,28 +187,18 @@ const getUseModel = async (
     );
     return { model: Router.longContext, scenarioType: 'longContext' };
   }
-  if (
-    req.body?.system?.length > 1 &&
-    req.body?.system[1]?.text?.startsWith("<CCR-SUBAGENT-MODEL>")
-  ) {
-    const model = req.body?.system[1].text.match(
-      /<CCR-SUBAGENT-MODEL>(.*?)<\/CCR-SUBAGENT-MODEL>/s
+  // 如果 token 数超过警告阈值但未触发 longContext，记录日志供用户排查 (#1292)
+  const warnThreshold = Router?.contextWarnThreshold || 90000;
+  if (tokenCount > warnThreshold) {
+    req.log.warn(
+      `Token count ${tokenCount} exceeds warning threshold ${warnThreshold}, consider configuring longContext with a lower longContextThreshold`
     );
-    if (model) {
-      req.body.system[1].text = req.body.system[1].text.replace(
-        `<CCR-SUBAGENT-MODEL>${model[1]}</CCR-SUBAGENT-MODEL>`,
-        ""
-      );
-      return { model: model[1], scenarioType: 'default' };
-    }
   }
-  // Use the background model for any Claude Haiku variant
+  // Use the background model for any Claude Haiku variant or "haiku" slot name
   const globalRouter = configService.get("Router");
-  if (
-    req.body.model?.includes("claude") &&
-    req.body.model?.includes("haiku") &&
-    globalRouter?.background
-  ) {
+  const isHaikuModel = req.body.model === "haiku" ||
+    (req.body.model?.includes("claude") && req.body.model?.includes("haiku"));
+  if (isHaikuModel && globalRouter?.background) {
     req.log.info(`Using background model for ${req.body.model}`);
     return { model: globalRouter.background, scenarioType: 'background' };
   }
@@ -193,10 +212,16 @@ const getUseModel = async (
   }
   // if exits thinking, use the think model
   if (req.body.thinking && Router?.think) {
-    req.log.info(`Using think model for ${req.body.thinking}`);
+    req.log.info(`Using think model for ${req.body.model} (budget: ${req.body.thinking.budget_tokens || 'auto'})`);
     return { model: Router.think, scenarioType: 'think' };
   }
-  return { model: Router?.default, scenarioType: 'default' };
+  // 校验 Router.default 是否存在，避免返回 undefined 模型导致下游 split(",") 崩溃
+  const defaultModel = Router?.default;
+  if (!defaultModel) {
+    req.log.warn('Router default model not configured, using original request model');
+    return { model: req.body.model, scenarioType: 'default' };
+  }
+  return { model: defaultModel, scenarioType: 'default' };
 };
 
 export interface RouterContext {
@@ -291,7 +316,20 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
   } catch (error: any) {
     req.log.error(`Error in router middleware: ${error.message}`);
     const Router = configService.get("Router");
-    req.body.model = Router?.default;
+    // 优先使用 Router.default 兜底，否则保留原始请求模型，禁止设置为 undefined
+    if (Router?.default) {
+      req.body.model = Router.default;
+    } else if (!req.body.model) {
+      // 无 Router.default 且原始 model 也丢失，返回错误响应
+      _res.code(503).send({
+        type: "error",
+        error: {
+          type: "api_error",
+          message: "Router service unavailable: no default model configured"
+        }
+      });
+      return;
+    }
     req.scenarioType = 'default';
   }
   return;

@@ -90,12 +90,10 @@ async function handleTransformerEndpoint(
     // Format and return response
     return formatResponse(finalResponse, reply, body);
   } catch (error: any) {
-    // Handle fallback if error occurs
-    if (error.code === 'provider_response_error') {
-      const fallbackResult = await handleFallback(req, reply, fastify, transformer, error);
-      if (fallbackResult) {
-        return fallbackResult;
-      }
+    // 对 provider 错误、超时、网络错误等均尝试 fallback，不仅限于 provider_response_error
+    const fallbackResult = await handleFallback(req, reply, fastify, transformer, error);
+    if (fallbackResult) {
+      return fallbackResult;
     }
     throw error;
   }
@@ -209,8 +207,19 @@ async function processRequestTransformers(
   let config: any = {};
   let bypass = false;
 
+  // 过滤掉非 custom 类型的工具（如 web_search、computer_use 等），
+  // 这些是 Claude Code 内部工具，不应发送给第三方 LLM 提供商
+  if (Array.isArray(requestBody.tools)) {
+    const filtered = requestBody.tools.filter(
+      (tool: any) => !tool.type || tool.type === "custom"
+    );
+    if (filtered.length !== requestBody.tools.length) {
+      requestBody = { ...requestBody, tools: filtered };
+    }
+  }
+
   // Check if transformers should be bypassed (passthrough mode)
-  bypass = shouldBypassTransformers(provider, transformer, body);
+  bypass = shouldBypassTransformers(provider, transformer, requestBody);
 
   if (bypass) {
     if (headers instanceof Headers) {
@@ -306,7 +315,17 @@ async function sendRequestToProvider(
   transformer: any,
   context: any
 ) {
-  const url = config.url || new URL(provider.baseUrl);
+  // 校验并规范化 Provider URL，避免无效 URL 导致请求失败 (#1303)
+  let url: URL;
+  try {
+    url = config.url || new URL(provider.baseUrl);
+  } catch (e: any) {
+    throw createApiError(
+      `Invalid provider URL: "${provider.baseUrl}". ${e.message}`,
+      400,
+      "invalid_url"
+    );
+  }
 
   // Handle authentication in passthrough mode
   if (bypass && typeof transformer.auth === "function") {

@@ -12,12 +12,13 @@ import {
   REFERENCE_COUNT_FILE,
   readPresetFile,
 } from "@CCR/shared";
-import { getServer } from "@CCR/server";
+// 使用动态导入避免 CLI 加载时触发整个服务端初始化（静态 import 会导致 ccr status/-v 等命令卡死）
+// import { getServer } from "@CCR/server";
 import { writeFileSync, existsSync, readFileSync, mkdirSync } from "fs";
 import { checkForUpdates, performUpdate } from "./update";
 import { version } from "../../package.json";
 import { spawn } from "child_process";
-import {cleanupPidFile, isServiceRunning} from "./processCheck";
+import {cleanupPidFile, isServiceRunning, findServicePid, killProcess} from "./processCheck";
 
 // Function to interpolate environment variables in config values
 const interpolateEnvVars = (obj: any): any => {
@@ -189,48 +190,124 @@ export const run = async (args: string[] = []) => {
     console.log('claude-code-router server is running');
     return;
   }
-  const server = await getServer();
-  const app = server.app;
-  // Save the PID of the background process
-  writeFileSync(PID_FILE, process.pid.toString());
+  // 启动前确保配置目录存在 (#1283)
+  await initDir();
 
-  app.post('/api/update/perform', async () => {
-    return await performUpdate();
-  })
+  try {
+    const { getServer } = await import("@CCR/server");
+    const server = await getServer();
+    const app = server.app;
+    // Save the PID of the background process
+    writeFileSync(PID_FILE, process.pid.toString());
 
-  app.get('/api/update/check', async () => {
-    return await checkForUpdates(version);
-  })
+    app.post('/api/update/perform', async () => {
+      return await performUpdate();
+    })
 
-  app.post("/api/restart", async () => {
-    setTimeout(async () => {
-      spawn("ccr", ["restart"], {
-        detached: true,
-        stdio: "ignore",
-      }).unref();
-    }, 100);
+    app.get('/api/update/check', async () => {
+      return await checkForUpdates(version);
+    })
 
-    return { success: true, message: "Service restart initiated" }
-  });
+    app.post("/api/restart", async () => {
+      setTimeout(async () => {
+        spawn("ccr", ["restart"], {
+          detached: true,
+          stdio: "ignore",
+        }).unref();
+      }, 100);
 
-  // await server.start() to ensure it starts successfully and keep process alive
-  await server.start();
+      return { success: true, message: "Service restart initiated" }
+    });
+
+    // await server.start() to ensure it starts successfully and keep process alive
+    await server.start();
+  } catch (e: any) {
+    // 启动失败时清理 PID 文件，避免残留
+    cleanupPidFile();
+
+    // 检测是否为端口占用错误（EADDRINUSE）
+    if (e.code === 'EADDRINUSE' || (e.message && e.message.includes('EADDRINUSE'))) {
+      const config = await readConfigFile();
+      const port = config.PORT || 3456;
+      console.error(`Port ${port} is already in use. Attempting to recover...`);
+
+      // 通过端口查找并杀掉占用进程
+      const { findPidByPort } = require('./processCheck');
+      const stalePid = findPidByPort(port);
+      if (stalePid !== null) {
+        try {
+          killProcess(stalePid);
+          console.log(`Killed stale process (PID: ${stalePid}) on port ${port}.`);
+          // 等待端口释放
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          // 重试启动
+          console.log('Retrying server start...');
+          const { getServer: getServer2 } = await import("@CCR/server");
+          const server = await getServer2();
+          const app = server.app;
+          writeFileSync(PID_FILE, process.pid.toString());
+          app.post('/api/update/perform', async () => {
+            return await performUpdate();
+          });
+          app.get('/api/update/check', async () => {
+            return await checkForUpdates(version);
+          });
+          app.post("/api/restart", async () => {
+            setTimeout(async () => {
+              spawn("ccr", ["restart"], { detached: true, stdio: "ignore" }).unref();
+            }, 100);
+            return { success: true, message: "Service restart initiated" };
+          });
+          await server.start();
+          return; // 重试成功
+        } catch (retryError: any) {
+          cleanupPidFile();
+          console.error(`Retry failed: ${retryError.message}`);
+          process.exit(1);
+        }
+      }
+    }
+
+    console.error(`Failed to start server: ${e.message}`);
+    process.exit(1);
+  }
 }
 
 export const restartService = async () => {
-  // Stop the service if it's running
+  // 停止服务：使用 findServicePid 替代直接读 PID 文件，支持端口 fallback
+  let stopped = false;
   try {
-    const pid = parseInt(readFileSync(PID_FILE, "utf-8"));
-    process.kill(pid);
-    cleanupPidFile();
-    if (existsSync(REFERENCE_COUNT_FILE)) {
-      try {
-        await fs.unlink(REFERENCE_COUNT_FILE);
-      } catch (e) {
-        // Ignore cleanup errors
+    const pid = findServicePid();
+    if (pid !== null) {
+      killProcess(pid);
+      cleanupPidFile();
+      if (existsSync(REFERENCE_COUNT_FILE)) {
+        try {
+          await fs.unlink(REFERENCE_COUNT_FILE);
+        } catch (e) {
+          // Ignore cleanup errors
+        }
+      }
+      console.log("claude code router service has been stopped.");
+      stopped = true;
+      // 等待端口释放，避免 EADDRINUSE
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    } else {
+      console.log("Service was not running.");
+      cleanupPidFile();
+      // 即便没有 PID，也要检查端口是否有残留进程并强杀
+      const { findPidByPort } = require('./processCheck');
+      const config = await readConfigFile();
+      const port = config.PORT || 3456;
+      const stalePid = findPidByPort(port);
+      if (stalePid !== null) {
+        console.log(`Found stale process (PID: ${stalePid}) still holding port ${port}, killing...`);
+        const { killProcess } = require('./processCheck');
+        killProcess(stalePid);
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        stopped = true;
       }
     }
-    console.log("claude code router service has been stopped.");
   } catch (e) {
     console.log("Service was not running or failed to stop.");
     cleanupPidFile();
@@ -246,11 +323,22 @@ export const restartService = async () => {
 
   startProcess.on("error", (error) => {
     console.error("Failed to start service:", error);
-    throw error;
+    // 即使 spawn error 也不卡死，让父进程有机会返回
   });
 
   startProcess.unref();
-  console.log("✅ Service started successfully in the background.");
+
+  // 等待服务真正启动后再报告结果
+  const maxWait = 10000;
+  const startTime = Date.now();
+  while (Date.now() - startTime < maxWait) {
+    if (isServiceRunning()) {
+      console.log("✅ Service started successfully in the background.");
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  console.error("❌ Service failed to start. Check logs for details.");
 };
 
 

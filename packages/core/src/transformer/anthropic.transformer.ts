@@ -87,78 +87,76 @@ export class AnthropicTransformer implements Transformer {
             const toolParts = msg.content.filter(
               (c: any) => c.type === "tool_result" && c.tool_use_id
             );
-            if (toolParts.length) {
-              toolParts.forEach((tool: any) => {
-                const toolMessage: UnifiedMessage = {
-                  role: "tool",
-                  content:
-                    typeof tool.content === "string"
-                      ? tool.content
-                      : JSON.stringify(tool.content),
-                  tool_call_id: tool.tool_use_id,
-                  cache_control: tool.cache_control,
-                };
-                messages.push(toolMessage);
-              });
-            }
-
             const textAndMediaParts = msg.content.filter(
               (c: any) =>
                 (c.type === "text" && c.text) ||
                 (c.type === "image" && c.source)
             );
-            if (textAndMediaParts.length) {
+
+            // 将 tool_result 转为文本描述，避免某些厂商（如 MiniMax）校验 tool_call_id 报错
+            const contentParts: any[] = [];
+            for (const tool of toolParts) {
+              const resultContent =
+                typeof tool.content === "string"
+                  ? tool.content
+                  : JSON.stringify(tool.content);
+              contentParts.push({
+                type: "text",
+                text: `[Tool Result]: ${resultContent}`,
+              });
+            }
+            for (const part of textAndMediaParts) {
+              if (part?.type === "image") {
+                contentParts.push({
+                  type: "image_url",
+                  image_url: {
+                    url:
+                      part.source?.type === "base64"
+                        ? formatBase64(
+                            part.source.data,
+                            part.source.media_type
+                          )
+                        : part.source.url,
+                  },
+                  media_type: part.source.media_type,
+                });
+              } else {
+                contentParts.push(part);
+              }
+            }
+            if (contentParts.length) {
               messages.push({
                 role: "user",
-                content: textAndMediaParts.map((part: any) => {
-                  if (part?.type === "image") {
-                    return {
-                      type: "image_url",
-                      image_url: {
-                        url:
-                          part.source?.type === "base64"
-                            ? formatBase64(
-                                part.source.data,
-                                part.source.media_type
-                              )
-                            : part.source.url,
-                      },
-                      media_type: part.source.media_type,
-                    };
-                  }
-                  return part;
-                }),
+                content:
+                  contentParts.length === 1 && contentParts[0].type === "text"
+                    ? contentParts[0].text
+                    : contentParts,
               });
             }
           } else if (msg.role === "assistant") {
-            const assistantMessage: UnifiedMessage = {
-              role: "assistant",
-              content: "",
-            };
+            const contentTexts: string[] = [];
+
             const textParts = msg.content.filter(
               (c: any) => c.type === "text" && c.text
             );
-            if (textParts.length) {
-              assistantMessage.content = textParts
-                .map((text: any) => text.text)
-                .join("\n");
+            for (const part of textParts) {
+              contentTexts.push(part.text);
             }
 
+            // 将 tool_use 转为文本描述，避免某些厂商不兼容结构化工具格式
             const toolCallParts = msg.content.filter(
               (c: any) => c.type === "tool_use" && c.id
             );
-            if (toolCallParts.length) {
-              assistantMessage.tool_calls = toolCallParts.map((tool: any) => {
-                return {
-                  id: tool.id,
-                  type: "function" as const,
-                  function: {
-                    name: tool.name,
-                    arguments: JSON.stringify(tool.input || {}),
-                  },
-                };
-              });
+            for (const tool of toolCallParts) {
+              contentTexts.push(
+                `[Called tool: ${tool.name}(${JSON.stringify(tool.input || {})})]`
+              );
             }
+
+            const assistantMessage: UnifiedMessage = {
+              role: "assistant",
+              content: contentTexts.join("\n"),
+            };
 
             const thinkingPart = msg.content.find(
               (c: any) => c.type === "thinking" && c.signature

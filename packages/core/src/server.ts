@@ -88,17 +88,24 @@ class Server {
       this.configService,
       this.app.log
     );
-    this.transformerService.initialize().finally(() => {
-      this.providerService = new ProviderService(
-        this.configService,
-        this.transformerService,
-        this.app.log
-      );
-    });
-    // Initialize tokenizer service
-    this.tokenizerService.initialize().catch((error) => {
+  }
+
+  /**
+   * 异步初始化 ProviderService 和 TokenizerService
+   * 必须在 registerNamespace / start 之前完成，避免竞态条件
+   */
+  private async initializeServices(): Promise<void> {
+    await this.transformerService.initialize();
+    this.providerService = new ProviderService(
+      this.configService,
+      this.transformerService,
+      this.app.log
+    );
+    try {
+      await this.tokenizerService.initialize();
+    } catch (error) {
       this.app.log.error(`Failed to initialize TokenizerService: ${error}`);
-    });
+    }
   }
 
   async register<Options extends FastifyPluginOptions = FastifyPluginOptions>(
@@ -199,6 +206,9 @@ class Server {
     try {
       this.app._server = this;
 
+      // 先完成所有服务初始化，避免 ProviderService 竞态
+      await this.initializeServices();
+
       this.app.addHook("preHandler", (req, reply, done) => {
         const url = new URL(`http://127.0.0.1${req.url}`);
         if (url.pathname.endsWith("/v1/messages") && req.body) {
@@ -241,7 +251,8 @@ class Server {
 
       const address = await this.app.listen({
         port: parseInt(this.configService.get("PORT") || "3000", 10),
-        host: this.configService.get("HOST") || "127.0.0.1",
+        // Docker 环境下 0.0.0.0 允许外部访问，127.0.0.1 仅本机
+        host: this.configService.get("HOST") || (process.env.DOCKER === 'true' ? '0.0.0.0' : '127.0.0.1'),
       });
 
       this.app.log.info(`🚀 LLMs API server listening on ${address}`);
