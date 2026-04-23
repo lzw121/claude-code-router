@@ -134,7 +134,7 @@ async function getServer(options: RunOptions = {}) {
     const hour = pad(date.getHours());
     const minute = pad(date.getMinutes());
 
-    return `./logs/ccr-${month}${day}${hour}${minute}${pad(date.getSeconds())}${index ? `_${index}` : ''}.log`;
+    return `./logs/ccr-${month}${day}${hour}${minute}${index ? `_${index}` : ''}.log`;
   };
 
   let loggerConfig: any;
@@ -153,8 +153,8 @@ async function getServer(options: RunOptions = {}) {
         level: config.LOG_LEVEL || "debug",
         stream: createStream(generator, {
           path: HOME_DIR,
-          maxFiles: 3,
-          interval: "1d",
+          maxFiles: 10,
+          interval: "1h",
           compress: false,
           maxSize: "50M"
         }),
@@ -390,6 +390,13 @@ async function getServer(options: RunOptions = {}) {
               try {
                 const message = JSON.parse(str);
                 sessionUsageCache.put(req.sessionId, message.usage);
+                const cached = message.usage?.cache_read_input_tokens || 0;
+                if (cached > 0) {
+                  req.log.info(
+                    { sessionId: req.sessionId, model: req.body?.model, provider: req.provider, cached_tokens: cached, total_input: (message.usage.input_tokens || 0) + cached },
+                    `Cache hit [${req.provider}/${req.body?.model}]: ${cached} cached tokens`
+                  );
+                }
               } catch {}
             }
           } catch (readError: any) {
@@ -406,6 +413,13 @@ async function getServer(options: RunOptions = {}) {
         return done(null, originalStream)
       }
       sessionUsageCache.put(req.sessionId, payload.usage);
+      const cachedNonStream = payload.usage?.cache_read_input_tokens || 0;
+      if (cachedNonStream > 0) {
+        req.log.info(
+          { sessionId: req.sessionId, model: req.body?.model, provider: req.provider, cached_tokens: cachedNonStream, total_input: (payload.usage.input_tokens || 0) + cachedNonStream },
+          `Cache hit [${req.provider}/${req.body?.model}]: ${cachedNonStream} cached tokens`
+        );
+      }
       if (typeof payload ==='object') {
         if (payload.error) {
           return done(payload.error, null)

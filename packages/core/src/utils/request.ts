@@ -11,9 +11,14 @@ export function sendUnifiedRequest(
   const headers = new Headers({
     "Content-Type": "application/json",
   });
+  // Node.js fetch 不支持的 header 黑名单，转发时必须过滤
+  const FORBIDDEN_HEADERS = new Set([
+    "host", "connection", "content-length", "transfer-encoding",
+    "expect", "upgrade", "keep-alive", "te", "trailer",
+  ]);
   if (config.headers) {
     Object.entries(config.headers).forEach(([key, value]) => {
-      if (value) {
+      if (value && !FORBIDDEN_HEADERS.has(key.toLowerCase())) {
         headers.set(key, value as string);
       }
     });

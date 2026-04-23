@@ -44,6 +44,195 @@ export class AnthropicTransformer implements Transformer {
     };
   }
 
+  /**
+   * 将 UnifiedChatRequest 转回标准 Anthropic 格式
+   * 解决 bypass=false 时（多个 transformer）Unified 格式直接发给 Anthropic 兼容端点的兼容性问题
+   */
+  async transformRequestIn(
+    request: UnifiedChatRequest,
+    provider: LLMProvider,
+    context: TransformerContext
+  ): Promise<Record<string, any>> {
+    const result: Record<string, any> = {
+      model: request.model,
+      max_tokens: request.max_tokens,
+      stream: request.stream,
+    };
+
+    // 1. 提取 system 消息 → 顶层 system 字段（Anthropic 标准格式）
+    const systemMessages: any[] = [];
+    const otherMessages: UnifiedMessage[] = [];
+
+    for (const msg of request.messages || []) {
+      if (msg.role === "system") {
+        // system 消息放到顶层 system 字段
+        if (typeof msg.content === "string") {
+          systemMessages.push({ type: "text", text: msg.content });
+        } else if (Array.isArray(msg.content)) {
+          for (const part of msg.content) {
+            if (part.type === "text" && part.text) {
+              systemMessages.push({
+                type: "text",
+                text: part.text,
+                ...(part.cache_control ? { cache_control: part.cache_control } : {}),
+              });
+            }
+          }
+        }
+      } else {
+        otherMessages.push(msg);
+      }
+    }
+
+    // 设置顶层 system 字段
+    if (systemMessages.length === 1 && !systemMessages[0].cache_control) {
+      result.system = systemMessages[0].text;
+    } else if (systemMessages.length > 0) {
+      result.system = systemMessages;
+    }
+
+    // 2. 转换消息格式：Unified → Anthropic
+    result.messages = otherMessages.map((msg) => {
+      // user 消息
+      if (msg.role === "user") {
+        if (typeof msg.content === "string") {
+          return { role: "user", content: msg.content };
+        }
+        if (Array.isArray(msg.content)) {
+          const parts: any[] = [];
+          for (const part of msg.content) {
+            if (part.type === "text") {
+              parts.push({ type: "text", text: part.text });
+            } else if (part.type === "image_url" && part.image_url) {
+              // base64 或 URL 图片
+              const url = part.image_url.url || "";
+              if (url.startsWith("data:")) {
+                const match = url.match(/^data:([^;]+);base64,(.+)$/);
+                if (match) {
+                  parts.push({
+                    type: "image",
+                    source: {
+                      type: "base64",
+                      media_type: match[1],
+                      data: match[2],
+                    },
+                  });
+                }
+              } else {
+                parts.push({
+                  type: "image",
+                  source: { type: "url", url },
+                });
+              }
+            }
+          }
+          return { role: "user", content: parts };
+        }
+        return { role: "user", content: msg.content || "" };
+      }
+
+      // assistant 消息
+      if (msg.role === "assistant") {
+        const contentParts: any[] = [];
+
+        // thinking 部分
+        if (msg.thinking?.content) {
+          contentParts.push({
+            type: "thinking",
+            thinking: msg.thinking.content,
+            ...(msg.thinking.signature
+              ? { signature: msg.thinking.signature }
+              : {}),
+          });
+        }
+
+        // 文本内容
+        if (typeof msg.content === "string" && msg.content) {
+          contentParts.push({ type: "text", text: msg.content });
+        }
+
+        // tool_calls 转回 Anthropic tool_use 格式
+        if (msg.tool_calls?.length) {
+          for (const tc of msg.tool_calls) {
+            let input: any = {};
+            try {
+              input = JSON.parse(tc.function.arguments || "{}");
+            } catch {}
+            contentParts.push({
+              type: "tool_use",
+              id: tc.id,
+              name: tc.function.name,
+              input,
+            });
+          }
+        }
+
+        // 简单文本
+        if (contentParts.length === 0 && typeof msg.content === "string") {
+          return { role: "assistant", content: msg.content };
+        }
+        return { role: "assistant", content: contentParts };
+      }
+
+      // tool 消息 → tool_result
+      if (msg.role === "tool") {
+        return {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: msg.tool_call_id,
+              content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
+            },
+          ],
+        };
+      }
+
+      return msg;
+    });
+
+    // 3. 转换 tools：Unified（OpenAI 格式）→ Anthropic 格式
+    if (request.tools?.length) {
+      result.tools = request.tools.map((tool: any) => {
+        // 已经是 Anthropic 格式（有 name + input_schema）
+        if (tool.name && tool.input_schema) {
+          return tool;
+        }
+        // Unified/OpenAI 格式（有 type + function）
+        if (tool.type === "function" && tool.function) {
+          return {
+            name: tool.function.name,
+            description: tool.function.description || "",
+            input_schema: tool.function.parameters || { type: "object", properties: {} },
+          };
+        }
+        return tool;
+      });
+    }
+
+    // 4. 转换 tool_choice
+    if (request.tool_choice) {
+      if (typeof request.tool_choice === "string") {
+        // "auto" | "any" | "none" 等直接映射
+        result.tool_choice = { type: request.tool_choice };
+      } else if (request.tool_choice?.type === "function" && request.tool_choice?.function?.name) {
+        result.tool_choice = { type: "tool", name: request.tool_choice.function.name };
+      } else if (request.tool_choice?.type) {
+        result.tool_choice = request.tool_choice;
+      }
+    }
+
+    // 5. 转换 reasoning → thinking
+    if (request.reasoning) {
+      result.thinking = {
+        type: request.reasoning.enabled !== false ? "enabled" : "disabled",
+        budget_tokens: request.reasoning.max_tokens || 10000,
+      };
+    }
+
+    return result;
+  }
+
   async transformRequestOut(
     request: Record<string, any>
   ): Promise<UnifiedChatRequest> {
@@ -93,16 +282,19 @@ export class AnthropicTransformer implements Transformer {
                 (c.type === "image" && c.source)
             );
 
-            // 将 tool_result 转为文本描述，避免某些厂商（如 MiniMax）校验 tool_call_id 报错
+            // 将 tool_result 转为结构化 tool 消息，保留工具调用上下文
             const contentParts: any[] = [];
+            const toolResultMessages: any[] = [];
             for (const tool of toolParts) {
               const resultContent =
                 typeof tool.content === "string"
                   ? tool.content
                   : JSON.stringify(tool.content);
-              contentParts.push({
-                type: "text",
-                text: `[Tool Result]: ${resultContent}`,
+              // 保留为独立的 tool role 消息（OpenAI 格式）
+              toolResultMessages.push({
+                role: "tool",
+                content: resultContent,
+                tool_call_id: tool.tool_use_id,
               });
             }
             for (const part of textAndMediaParts) {
@@ -133,6 +325,10 @@ export class AnthropicTransformer implements Transformer {
                     : contentParts,
               });
             }
+            // tool_result 作为独立的 tool 消息插入
+            for (const trm of toolResultMessages) {
+              messages.push(trm);
+            }
           } else if (msg.role === "assistant") {
             const contentTexts: string[] = [];
 
@@ -143,20 +339,30 @@ export class AnthropicTransformer implements Transformer {
               contentTexts.push(part.text);
             }
 
-            // 将 tool_use 转为文本描述，避免某些厂商不兼容结构化工具格式
+            // 将 tool_use 转为结构化 tool_calls，保留工具调用能力
             const toolCallParts = msg.content.filter(
               (c: any) => c.type === "tool_use" && c.id
             );
+            const toolCalls: any[] = [];
             for (const tool of toolCallParts) {
-              contentTexts.push(
-                `[Called tool: ${tool.name}(${JSON.stringify(tool.input || {})})]`
-              );
+              toolCalls.push({
+                id: tool.id,
+                type: "function",
+                function: {
+                  name: tool.name,
+                  arguments: JSON.stringify(tool.input || {}),
+                },
+              });
             }
 
             const assistantMessage: UnifiedMessage = {
               role: "assistant",
-              content: contentTexts.join("\n"),
+              content: contentTexts.join("\n") || null,
             };
+            // 保留结构化 tool_calls，供下游 OpenAI 格式使用
+            if (toolCalls.length) {
+              assistantMessage.tool_calls = toolCalls;
+            }
 
             const thinkingPart = msg.content.find(
               (c: any) => c.type === "thinking" && c.signature
@@ -186,13 +392,15 @@ export class AnthropicTransformer implements Transformer {
         : undefined,
       tool_choice: request.tool_choice,
     };
-    if (request.thinking) {
-      result.reasoning = {
-        effort: getThinkLevel(request.thinking.budget_tokens),
-        // max_tokens: request.thinking.budget_tokens,
-        enabled: request.thinking.type === "enabled",
-      };
-    }
+    // GLM 等 Anthropic 兼容端点不支持 reasoning 参数，直接删除
+    // 避免上游 API 报错导致请求失败
+    // if (request.thinking) {
+    //   result.reasoning = {
+    //     effort: getThinkLevel(request.thinking.budget_tokens),
+    //     // max_tokens: request.thinking.budget_tokens,
+    //     enabled: request.thinking.type === "enabled",
+    //   };
+    // }
     if (request.tool_choice) {
       if (request.tool_choice.type === "tool") {
         result.tool_choice = {
@@ -213,12 +421,76 @@ export class AnthropicTransformer implements Transformer {
     const isStream = response.headers
       .get("Content-Type")
       ?.includes("text/event-stream");
+
     if (isStream) {
       if (!response.body) {
         throw new Error("Stream response body is null");
       }
+
+      // 读取第一个 chunk 检测格式，然后构建新流把第一个 chunk 放回去
+      const reader = response.body.getReader();
+      let firstChunk: Uint8Array | undefined;
+      try {
+        const { value } = await reader.read();
+        firstChunk = value;
+      } catch {}
+
+      const headerChunk = firstChunk
+        ? new TextDecoder().decode(firstChunk)
+        : "";
+
+      // Anthropic SSE 以 "event: message_start" 或 "event: ping" 开头
+      // OpenAI SSE 以 "data: {" 开头，包含 choices 字段
+      const isAnthropicSSE =
+        headerChunk.includes("event: message_start") ||
+        headerChunk.includes("event: ping") ||
+        headerChunk.includes('"type":"message_start"') ||
+        headerChunk.includes('"type": "message_start"');
+
+      // 构建一个新流，先把 firstChunk 放回去，再继续读 reader
+      const replayStream = new ReadableStream({
+        start: (controller) => {
+          if (firstChunk) {
+            controller.enqueue(firstChunk);
+          }
+          const pump = async () => {
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                  controller.close();
+                  break;
+                }
+                controller.enqueue(value);
+              }
+            } catch (e) {
+              controller.error(e);
+            }
+          };
+          pump();
+        },
+        cancel: () => {
+          reader.cancel().catch(() => {});
+        },
+      });
+
+      if (isAnthropicSSE) {
+        this.logger.debug(
+          { reqId: context?.req.id },
+          `Stream response is already Anthropic SSE format, pass-through`
+        );
+        return new Response(replayStream, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          },
+        });
+      }
+
+      // OpenAI 格式，需要转换
       const convertedStream = await this.convertOpenAIStreamToAnthropic(
-        response.body,
+        replayStream,
         context!
       );
       return new Response(convertedStream, {
@@ -230,6 +502,16 @@ export class AnthropicTransformer implements Transformer {
       });
     } else {
       const data = (await response.json()) as any;
+      // 非流式：检测是否已经是 Anthropic 格式
+      if (data.type === "message" && Array.isArray(data.content)) {
+        this.logger.debug(
+          { reqId: context?.req.id },
+          `Non-stream response is already Anthropic format, pass-through`
+        );
+        return new Response(JSON.stringify(data), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       const anthropicResponse = this.convertOpenAIResponseToAnthropic(
         data,
         context!
@@ -958,6 +1240,17 @@ export class AnthropicTransformer implements Transformer {
       },
       `Original OpenAI response`
     );
+    // 如果响应已经是 Anthropic 格式（如 GLM 的 Anthropic 兼容端点），直接透传
+    if (
+      (openaiResponse as any).type === "message" &&
+      Array.isArray((openaiResponse as any).content)
+    ) {
+      this.logger.debug(
+        { reqId: context.req.id },
+        `Response is already Anthropic format, pass-through`
+      );
+      return openaiResponse;
+    }
     try {
       const choice = openaiResponse.choices[0];
       if (!choice) {
